@@ -18,14 +18,17 @@ They are marked xfail and flip to passing as you implement each function.
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 from thefuzz import fuzz
 
 from agent import db
-from agent.auth import AuthContext, can_cancel_order, permission_denied
+from agent.auth import AuthContext, can_cancel_order, can_view_order, permission_denied
+from agent.config import load_facts
 from agent.helpcenter import load_policy_docs
 from agent.killswitch import kill_switch
+from seed.eligibility import effective_return_window_days, is_refund_eligible
 
 MAX_SEARCH_LIMIT = 25
 DEFAULT_ORDER_LIMIT = 20
@@ -298,3 +301,123 @@ def find_order(ctx: AuthContext, query: str) -> dict[str, Any]:
         "ok": True,
         "orders": [o.to_public_dict() for o in order_candidates[:5]],
     }
+
+
+def check_refund_eligibility(
+    ctx: AuthContext, order_id: int, request_date: str | None = None
+) -> dict[str, Any]:
+    """Check whether an order is refund/return eligible. Risk tier: read.
+
+    Custom HW1 tool. It surfaces, as structured data, the eligibility decision
+    that otherwise only exists as the order's stamped ``refund_eligible`` flag
+    or as prose in the policy documents. It determines eligibility from three
+    things, in order:
+
+    1. The order's status and delivery date (only a delivered order with a
+       delivery date can be returned).
+    2. The store's return-window override
+       (agent.db.Store.return_window_days_override), which takes precedence.
+    3. The platform default window (facts.yaml ``return_window_days``) when the
+       store has no override.
+
+    The window rule matches cw-store-overrides and the eligibility oracle in
+    seed/eligibility.py, which this tool reuses rather than re-deriving.
+
+    Access follows the order access matrix (agent.auth.can_view_order): a caller
+    may only check an order in their own scope. An out-of-scope caller gets
+    permission_denied and learns nothing about the order.
+
+    Args:
+        ctx: The caller's auth context.
+        order_id: The order to check.
+        request_date: Optional ISO date (YYYY-MM-DD) standing for when the
+            refund/return is requested. Defaults to the world's current date
+            (agent.db.world_asof), which is the date the order's stamped
+            ``refund_eligible`` flag was computed against. Passing a different
+            date answers a hypothetical ("would this be eligible if requested
+            then?").
+
+    Returns:
+        On success: {"ok": True, "eligible": bool, "reason": <explanation>,
+        "status", "delivered_at", "as_of", "effective_window_days",
+        "window_source" ("store_override" or "platform_default"),
+        "platform_window_days", "store_override_days",
+        "stamped_refund_eligible"}.
+
+        Errors: not_found for an unknown order; permission_denied for an order
+        outside the caller's scope; invalid_argument for an unparseable
+        request_date.
+    """
+    with db.connection() as conn:
+        order = db.get_order(conn, order_id)
+        if order is None:
+            return {"ok": False, "error": "not_found", "reason": f"no order #{order_id}"}
+        if not can_view_order(ctx, order.user_id, order.store_id):
+            return permission_denied(
+                f"role '{ctx.role}' (user {ctx.user_id}) may not view order #{order_id}"
+            )
+        if request_date is None:
+            as_of = db.world_asof(conn)
+        else:
+            try:
+                as_of = date.fromisoformat(request_date)
+            except ValueError:
+                return {
+                    "ok": False,
+                    "error": "invalid_argument",
+                    "reason": (
+                        "request_date must be an ISO date (YYYY-MM-DD); "
+                        f"got {request_date!r}"
+                    ),
+                }
+
+        store = db.get_store(conn, order.store_id)
+        override = store.return_window_days_override if store else None
+        platform_window = load_facts()["return_window_days"]
+        window = effective_return_window_days(platform_window, override)
+        window_source = "store_override" if override is not None else "platform_default"
+
+        eligible = is_refund_eligible(
+            status=order.status,
+            delivered_at=order.delivered_at,
+            as_of=as_of,
+            return_window_days=window,
+        )
+
+        if order.status != "delivered":
+            reason = (
+                f"Order #{order_id} has status '{order.status}', so it is not "
+                "refund-eligible; only delivered orders can be returned."
+            )
+        elif order.delivered_at is None:
+            reason = (
+                f"Order #{order_id} has no delivery date on record, so "
+                "eligibility cannot be determined."
+            )
+        else:
+            age = (as_of - order.delivered_at).days
+            if override is not None and store is not None:
+                window_label = f"{store.name}'s {window}-day store return window"
+            else:
+                window_label = f"the {window}-day platform return window"
+            position = "within" if eligible else "past"
+            reason = (
+                f"Order #{order_id} was delivered {order.delivered_at.isoformat()} "
+                f"({age} days before {as_of.isoformat()}), {position} {window_label}, "
+                f"so it is {'refund-eligible' if eligible else 'not refund-eligible'}."
+            )
+
+        return {
+            "ok": True,
+            "order_id": order_id,
+            "eligible": eligible,
+            "reason": reason,
+            "status": order.status,
+            "delivered_at": order.delivered_at.isoformat() if order.delivered_at else None,
+            "as_of": as_of.isoformat(),
+            "effective_window_days": window,
+            "window_source": window_source,
+            "platform_window_days": platform_window,
+            "store_override_days": override,
+            "stamped_refund_eligible": order.refund_eligible,
+        }
